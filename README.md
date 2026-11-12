@@ -33,8 +33,9 @@ displays a recommendation. It never carries one out.
 
 ## Run it
 
-You need Node.js and a decision service that speaks the contract described
-below.
+You need Node.js and a decision service: either one that speaks the contract
+described below, or an [Ollaya](https://github.com/ollaya-dev/ollaya) service
+(see [With an Ollaya service](#with-an-ollaya-service)).
 
 ```bash
 JEV_UPSTREAM=http://127.0.0.1:8081 node server.cjs
@@ -54,9 +55,43 @@ The page loads whether or not the decision service is up. While it is down the
 header reads "Service unavailable" and a run returns a `jev_offline` error. Your
 edits stay in the page.
 
-The helper has no dependencies. It was tested on Node.js 24. It uses the
+The helper has no dependencies. It was tested on Node.js 24 and 26. It uses the
 built-in `fetch`, which Node.js has shipped without a flag since version 18, and
 `AbortSignal.timeout`.
+
+### With an Ollaya service
+
+Ollaya serves decision models over HTTP and has the same `/v1/systemone`
+route. Set `JEV_BACKEND=ollaya` and name a model the service has:
+
+```bash
+JEV_UPSTREAM=http://127.0.0.1:11435 JEV_BACKEND=ollaya JEV_MODEL=winnow:e4b node server.cjs
+```
+
+In PowerShell:
+
+```powershell
+$env:JEV_UPSTREAM = 'http://127.0.0.1:11435'
+$env:JEV_BACKEND = 'ollaya'
+$env:JEV_MODEL = 'winnow:e4b'
+node server.cjs
+```
+
+In this mode the helper does two things differently:
+
+- **Health.** An Ollaya service has no `/health` route. The helper asks it for
+  its version (`GET /api/version`) and for the configured model
+  (`POST /api/show`). The page header shows that version and model. If the
+  service does not have the model, the header says so.
+- **Model name.** Every example in the page carries the model name `openjev`.
+  The helper replaces the `model` in each request with `JEV_MODEL` before it
+  forwards the request. Everything else in the request is sent as it is.
+
+Responses pass through unchanged, errors included. Ollaya reports an error as
+`{"error": "<text>", "code": "<CODE>"}`, and the page shows that whole body.
+
+This mode was tested with Ollaya 0.7.5 and 0.18.0. The routes it uses are in
+the [Ollaya API reference](https://github.com/ollaya-dev/ollaya/blob/v0.18.0/site/docs/api.md).
 
 ## Configuration
 
@@ -68,6 +103,8 @@ The helper reads environment variables only.
 | `JEV_BIND` | no | `127.0.0.1` | Address to listen on. |
 | `JEV_PORT` | no | `9999` | Port to listen on. |
 | `JEV_ALLOWED_HOSTS` | no | none | Extra `Host` header values to accept, comma-separated, each written as `host:port`. |
+| `JEV_BACKEND` | no | `jev` | Kind of decision service. `jev` is the contract described below. `ollaya` is an Ollaya service. The helper exits with an error on any other value. |
+| `JEV_MODEL` | with `JEV_BACKEND=ollaya` | none | A model installed on the Ollaya service. It answers every decision. The helper exits with an error when the backend is `ollaya` and this is missing. The `jev` backend does not use it. |
 
 The helper accepts a request only when its `Host` header is `127.0.0.1:<port>`,
 `localhost:<port>`, the bind address with the port, or a value from
@@ -80,11 +117,12 @@ hostname, add that name and port to `JEV_ALLOWED_HOSTS`.
 |---|---|
 | `GET /` | The playground page |
 | `GET /healthz` | Health of the helper itself |
-| `GET /api/health`, `/health`, `/v1/version` | Forwarded to `GET <JEV_UPSTREAM>/health` |
+| `GET /api/health`, `/health`, `/v1/version` | Forwarded to `GET <JEV_UPSTREAM>/health`. With `JEV_BACKEND=ollaya`, built from the service's `/api/version` and `/api/show` instead. |
 | `POST /api/decide`, `/v1/systemone` | Forwarded to `POST <JEV_UPSTREAM>/v1/systemone` |
 
 Request bodies are limited to 2 MiB. Before a decision is forwarded the helper
-checks the service's `/health`. If that check fails it answers `503` with
+checks the service's `/health` (`GET /` on an Ollaya service). If that check
+fails it answers `503` with
 `{"ready": false, "error": {"code": "jev_offline", ...}}` and does not replay
 the request.
 
@@ -92,7 +130,8 @@ the request.
 
 This is what the page sends and what it reads back. Your service can return
 more fields. The page shows them in the raw response and ignores them
-otherwise.
+otherwise. This is the default `jev` backend. An Ollaya service has a different
+health route and error body, and `JEV_BACKEND=ollaya` handles both.
 
 `GET /health` should return JSON with `ready` (boolean), `contract` and `model`
 (strings shown in the header).
@@ -153,6 +192,15 @@ answers:
 node check-examples.cjs --run http://127.0.0.1:9999
 ```
 
+## Run the tests
+
+```bash
+node --test
+```
+
+The tests start the helper against stand-in services on loopback ports. They
+need no model and no network.
+
 ## Security
 
 - There is no authentication. Anyone who can reach the helper can submit model
@@ -168,7 +216,11 @@ node check-examples.cjs --run http://127.0.0.1:9999
 - The page text and examples were written for an APUS-OpenJev 4B Q8 model
   behind a local adapter that exposes `/v1/systemone`. That adapter is not part
   of this repository. The text in the page describes that setup: text input
-  only, and no ordinal scores.
+  only, and no ordinal scores. It reads the same whichever service you run.
+  The header shows the model that is answering.
+- With `JEV_BACKEND=ollaya` the helper sends no API key. An Ollaya service
+  started with `OLLAYA_API_KEY` answers `401`, and the header then reports
+  that the service refused the helper's check.
 - Scores are relative probabilities across the choices you supplied. They are
   not calibrated confidence and they do not show that an answer is correct.
 - A model can pick a wrong winner when evidence is missing or the options are

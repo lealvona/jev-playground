@@ -9,6 +9,12 @@
 //   JEV_PORT           optional  Port to listen on. Default 9999.
 //   JEV_ALLOWED_HOSTS  optional  Extra Host header values to accept,
 //                                comma-separated, each as host:port.
+//   JEV_BACKEND        optional  Kind of decision service: "jev" (default,
+//                                the /health and /v1/systemone contract in
+//                                the README) or "ollaya".
+//   JEV_MODEL          required with JEV_BACKEND=ollaya, unused otherwise.
+//                                A model installed on the Ollaya service. It
+//                                answers every decision.
 const http = require('node:http');
 const fs = require('node:fs');
 const path = require('node:path');
@@ -37,6 +43,15 @@ try {
   fail(`JEV_UPSTREAM must be an http(s) base URL (${e.message}).`);
 }
 
+const backend = process.env.JEV_BACKEND || 'jev';
+if (backend !== 'jev' && backend !== 'ollaya') {
+  fail(`JEV_BACKEND must be "jev" or "ollaya", not "${backend}".`);
+}
+const model = process.env.JEV_MODEL || '';
+if (backend === 'ollaya' && !model) {
+  fail('JEV_MODEL is not set. With JEV_BACKEND=ollaya, set it to a model installed on the Ollaya service, for example JEV_MODEL=winnow:e4b');
+}
+
 // Requests are accepted only when the Host header names this server. That
 // stops another website from reaching the helper through DNS rebinding.
 const hostLabel = bind.includes(':') ? `[${bind}]` : bind;
@@ -57,6 +72,31 @@ const offline = {
     message: 'The decision service is offline or unreachable. The playground and your edits remain available. Start the decision service, then check the connection or retry.',
   },
 };
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
+// The route that shows the service is up. Ollaya has no /health route.
+const LIVENESS_PATH = backend === 'ollaya' ? '/' : '/health';
+
+// Health for an Ollaya service: it is ready when it answers and has the
+// configured model. Returns the status and body to send to the page.
+async function ollayaHealth() {
+  const ask = async (route, init) => {
+    const response = await fetch(upstream + route, { ...init, signal: AbortSignal.timeout(3000) });
+    return { ok: response.ok, status: response.status, data: (await response.json().catch(() => null)) || {} };
+  };
+  const [version, shown] = await Promise.all([
+    ask('/api/version'),
+    ask('/api/show', { method: 'POST', headers: JSON_HEADERS, body: JSON.stringify({ model }) }),
+  ]);
+  const notReady = (code, message) => [503, { ready: false, error: { code, message } }];
+  if (shown.data.code === 'MODEL_NOT_FOUND') {
+    return notReady('model_not_found', `The Ollaya service does not have the model "${model}". Pull it there, or set JEV_MODEL to a model it has.`);
+  }
+  const refused = [version, shown].find((answer) => !answer.ok);
+  if (refused) {
+    return notReady('ollaya_refused', `The Ollaya service answered HTTP ${refused.status} to the helper's check.`);
+  }
+  return [200, { ready: true, contract: `ollaya ${version.data.version}`, model }];
+}
 
 const server = http.createServer(async (req, res) => {
   const send = (status, body, type = 'application/json') => {
@@ -78,7 +118,7 @@ const server = http.createServer(async (req, res) => {
 
   try {
     if (decision) {
-      const check = await fetch(upstream + '/health', { signal: AbortSignal.timeout(3000) });
+      const check = await fetch(upstream + LIVENESS_PATH, { signal: AbortSignal.timeout(3000) });
       if (!check.ok) return send(503, offline);
     }
     let body = '';
@@ -86,9 +126,25 @@ const server = http.createServer(async (req, res) => {
       body += chunk;
       if (Buffer.byteLength(body) > MAX_BODY_BYTES) return send(413, { error: { message: 'Payload exceeds 2 MiB' } });
     }
+    if (backend === 'ollaya') {
+      if (health) return send(...(await ollayaHealth()));
+      // Ollaya answers only for a model it has, so the configured model
+      // replaces whatever name the request carries.
+      let payload = null;
+      try {
+        payload = JSON.parse(body);
+      } catch (e) {
+        // Refused below.
+      }
+      if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) {
+        return send(400, { error: { message: 'The request body must be a JSON object.' } });
+      }
+      payload.model = model;
+      body = JSON.stringify(payload);
+    }
     const response = await fetch(upstream + (health ? '/health' : '/v1/systemone'), {
       method: req.method,
-      headers: { 'Content-Type': 'application/json' },
+      headers: JSON_HEADERS,
       body: decision ? body : undefined,
       signal: AbortSignal.timeout(health ? 3000 : 120000),
     });
@@ -100,7 +156,8 @@ const server = http.createServer(async (req, res) => {
 
 server.on('error', (e) => fail(`cannot listen on ${hostLabel}:${port}: ${e.message}`));
 server.listen(port, bind, () => {
-  console.log(`JEV playground: http://${wildcard ? 'localhost' : hostLabel}:${port}/  (decision service: ${upstream})`);
+  const service = backend === 'ollaya' ? `Ollaya at ${upstream}, model ${model}` : upstream;
+  console.log(`JEV playground: http://${wildcard ? 'localhost' : hostLabel}:${port}/  (decision service: ${service})`);
   console.log(`Accepted Host headers: ${[...allowedHosts].join(', ')}`);
   if (bind !== '127.0.0.1' && bind !== '::1' && bind !== 'localhost') {
     console.log('Warning: there is no authentication. Anyone who can reach this address can submit model requests.');
